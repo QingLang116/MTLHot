@@ -1,0 +1,200 @@
+#!/usr/bin/env python
+
+###
+### MTLHot: a multi-task deep learning-based framework for detecting immune-hot tumors
+###
+###	Version:
+###
+###		1.0
+###
+###	Authors:
+###
+###		Shiwei Zhu (wwzpll@163.com)
+###
+###	Requirements:
+###
+### 	python 3.10.x
+###		tensorflow 2.10.0
+###		keras 2.10.0
+###		pandas 2.1.4
+###		scikit-learn 1.3.2
+###
+### Minimum Inputs:
+###
+###	    - gene expression data: tab-separated, row names represent sample names and column headings are gene symbols,
+###								gene expression values must be log2-transformed.
+###
+### Outputs:
+###
+###		Creates a directory in the current working directory, and writes all output to that
+###		Information and warnings are logged to standard error
+
+from __future__ import print_function
+from __future__ import division
+import os, sys
+import pickle
+from optparse import OptionParser
+
+import joblib
+import numpy as np
+from keras.saving.save import load_model
+from sklearn.decomposition import PCA
+
+
+parser = OptionParser()
+##
+## required options
+##
+parser.add_option("-d", "--GEdata", dest="GEdata", action="store", type="string", default=None, help="\
+File with log2-transformed gene expression data: The row names represent sample names and the column headings are the gene symbols.")
+
+##
+## Optional parameters
+##
+parser.add_option("--output_folder", dest="output_folder", action="store", default='outputs')
+(opts, args) = parser.parse_args()
+
+
+##
+## Basic input validation
+##
+# Fatal Errors
+if opts.GEdata is None:
+	sys.stderr.write("Warning: Must supply an input gene expression data")
+	sys.exit(1)
+
+# local imports assume the directory structure from github.
+script_directory = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(script_directory.replace("bin", "lib"))
+
+from DEC import *
+from MTL_model import *
+from load_data import *
+
+# -------------------------------- load addition GE data file --------------------------------------- #
+sys.stderr.write("load data:------------\n")
+
+# set the output folder for the reports and networks, create the directory
+output_folder = opts.output_folder
+if not os.path.exists(output_folder):
+	os.mkdir(output_folder)
+# load extra expression data
+data_exp_val, exp_gene_names, val_sample_names = load_feature_data(opts.GEdata)
+
+if np.max(data_exp_val) > 50:
+	sys.stderr.write("Warning: GEdata must be log2-transformed")
+	sys.exit(1)
+
+# load TCGA data
+TCGA_exp_data_path = script_directory.replace("bin", "TCGA_exp_data")
+data_exp_tcga, exp_gene_tcga, exp_sample_names = load_feature_data(TCGA_exp_data_path+'/log.exp.matrix.csv')
+pheno_score, pheno_labels, sample_names = load_phenotype_data(TCGA_exp_data_path+'/pan.cancer.phenotype.csv')
+phenotypes = pheno_labels
+
+# ---------------------------data pre-processing-------------------------------------- #
+sys.stderr.write("data pre-processing:------------\n")
+
+valid_exp_genes_idx = np.where(exp_gene_tcga == exp_gene_names[:, None])[1]
+X_tcga = data_exp_tcga[:, valid_exp_genes_idx]
+normalized_X_tcga, Y_train = load_final_data(X_tcga, pheno_score, shuffle=False)
+scaled_val_exp = normalized_val_data(val_feature_data=data_exp_val, train_feature_data=normalized_X_tcga)
+
+sys.stderr.write("PCA:------------\n")
+
+# PCA
+exp_pca = PCA(n_components=300)
+exp_pca.fit(normalized_X_tcga)
+X_train_transformed = exp_pca.transform(normalized_X_tcga)
+X_val_transformed = exp_pca.transform(scaled_val_exp)
+
+
+# ----------------------------------retrain MTL model---------------------------------------------#
+sys.stderr.write("MTL model training:------------\n")
+
+MDNN_hyperparams = {"epochs": 200,
+					"inner_activation": "relu",
+					"hidden_sizes_shared": [100],
+					"hidden_sizes_separate": [50, 10],
+					"dropout": 0.3,
+					"k_reg": 0.1,
+					"learning_rate": 0.001,
+					"batch_size": 50}
+input_size = X_train_transformed.shape[1]
+MTL_model = get_prediction_model(MDNN_hyperparams, input_size, phenotypes)
+trainable_model = get_trainable_model(MTL_model, input_size)
+opt = adam_v2.Adam(learning_rate=MDNN_hyperparams["learning_rate"])
+trainable_model.compile(optimizer=opt, loss=None)
+trainable_model.fit([X_train_transformed,
+					 Y_train[phenotypes[0]], Y_train[phenotypes[1]],
+					 Y_train[phenotypes[2]], Y_train[phenotypes[3]]],
+					epochs=MDNN_hyperparams["epochs"],
+					batch_size=MDNN_hyperparams["batch_size"],
+					shuffle=True,
+					verbose=0)
+loss_weight = [np.exp(K.get_value(log_var[0])) ** 0.5 for log_var in trainable_model.layers[-1].log_vars]
+
+# 存储模型
+MTL_model.compile(optimizer=adam_v2.Adam(), loss=None)
+MTL_model.save(output_folder + "/MTL_model.h5")
+sys.stderr.write("Saving the retrained MTL model to" + output_folder + "/MTL_model.h5\n")
+
+# 存储全部的模型参数
+weight_list = []
+for layer in MTL_model.layers:
+	weight_list.append(layer.get_weights())
+pickle.dump(weight_list, open(output_folder + "/MTL_model_weight.p", "wb"))
+sys.stderr.write("Saving the weights of the MTL_model to" + output_folder + "/MTL_model_weight.p\n")
+
+# -----------------------------model predicting----------------------------------------#
+
+y_predicts = MTL_model.predict(X_val_transformed)
+per_pred_res = []
+for i in range(4):
+	y_pred = y_predicts[i]
+	per_pred_res.append(np.hstack(y_pred))
+pred_df = pd.DataFrame(np.array(per_pred_res, dtype=float)).T
+pred_df.columns = phenotypes
+pred_df.rename(index=dict(zip(pred_df.index, val_sample_names)), inplace=True)
+pred_df.to_csv(output_folder + "/extra_data_preds.csv")
+
+sys.stderr.write("Writing the predicted phen scores to" + output_folder + "/extra_data_preds.csv\n")
+
+# --------------------------------Deep Embedded Clustering--------------------------------#
+sys.stderr.write("Deep Embedded Clustering:------------\n")
+
+n_clusters = 2
+rep = 0
+HIDDEN_LAYER = 1
+mod_to_layer = get_model_layers(output_folder + "/MTL_model.h5", num_layers=HIDDEN_LAYER)
+
+model = DEC(mod_to_layer, n_clusters,
+			X_train=X_val_transformed,
+			maxiterV=1000,
+			update_interval=100,
+			tol=1/X_val_transformed.shape[0],
+			batch_size=10)
+model.save_weights(output_folder + '/DEC_model_final_%s.h5' % str(n_clusters))
+
+q = model.predict(X_val_transformed, verbose=0)
+p = target_distribution(q)  # update the auxiliary target distribution p
+
+y_pred = q.argmax(1)
+data1 = pd.DataFrame(y_pred, index=val_sample_names)
+data1.columns = ["Cluster"]
+
+index_with_value_0 = data1[data1['Cluster'] == 0].index
+index_with_value_1 = data1[data1['Cluster'] == 1].index
+pred_df_0_rows_mean = pred_df.loc[index_with_value_0].values.mean()
+pred_df_1_rows_mean = pred_df.loc[index_with_value_1].values.mean()
+
+if pred_df_0_rows_mean > pred_df_1_rows_mean:
+	data1['Cluster'] = data1['Cluster'].replace(0, 'Cluster_1')
+	data1['Cluster'] = data1['Cluster'].replace(1, 'Cluster_0')
+else:
+	data1['Cluster'] = data1['Cluster'].replace(0, 'Cluster_0')
+	data1['Cluster'] = data1['Cluster'].replace(1, 'Cluster_1')
+
+data1.to_csv(output_folder + '/Clustering_res.csv')
+
+sys.stderr.write("Writing the Clustering results to" + output_folder + "/Clustering_res.csv\n")
+
